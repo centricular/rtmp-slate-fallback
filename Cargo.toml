@@ -1,0 +1,16 @@
+[package]
+name = "rtmp-slate-fallback"
+version = "0.1.0"
+authors = ["Mathieu Duponchelle <mathieu@centricular.com>"]
+edition = "2018"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+glib = { git = "https://github.com/gtk-rs/glib" }
+structopt = { version = "0.3", default-features = false }
+
+[dependencies.gst]
+git = "https://gitlab.freedesktop.org/gstreamer/gstreamer-rs"
+features = ["v1_14"]
+package="gstreamer"
