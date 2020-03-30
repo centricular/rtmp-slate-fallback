@@ -15,10 +15,30 @@ struct Args {
     discard_after: Option<u64>,
 }
 
+fn default_handle_message(pipe: &gst::Pipeline, msg: &gst::Message) {
+    match msg.view() {
+        gst::MessageView::Latency(..) => {
+            println!("Recalculating latency!");
+            pipe.recalculate_latency().unwrap();
+        }
+        gst::MessageView::StateChanged(state_changed) => {
+            if state_changed.get_src().map(|s| &s == pipe).unwrap_or(false)
+                && state_changed.get_current() == gst::State::Playing
+            {
+                pipe.debug_to_dot_file(
+                    gst::DebugGraphDetails::all(),
+                    format!("PLAYING-{}", pipe.get_name()),
+                );
+            }
+        }
+        _ => (),
+    }
+}
+
 fn build_rtmp_pipeline(args: &Args) -> Result<gst::Pipeline, anyhow::Error> {
     let playbin = gst::ElementFactory::make("playbin3", Some("rtmp_source"))?;
     let vsink = gst::parse_bin_from_description(
-        "identity name=id ! interpipesink forward-eos=true drop=false sync=true name=rtmp",
+        "identity name=id ! interpipesink drop=false sync=true name=rtmp",
         true,
     )?;
     let asink = gst::ElementFactory::make("fakesink", None)?;
@@ -37,7 +57,44 @@ fn build_rtmp_pipeline(args: &Args) -> Result<gst::Pipeline, anyhow::Error> {
     playbin.set_property("video-sink", &vsink)?;
     playbin.set_property("audio-sink", &asink)?;
 
-    Ok(playbin.downcast::<gst::Pipeline>().unwrap())
+    let pipe = playbin.downcast::<gst::Pipeline>().unwrap();
+    let bus = pipe.get_bus().unwrap();
+    let pipe_clone = pipe.clone();
+    let uri = args.live_rtmp_uri.clone();
+
+    bus.add_watch(move |_, msg| {
+        let pipe = &pipe_clone;
+        match msg.view() {
+            gst::MessageView::Error(err) => {
+                /* Naive throttling */
+                std::thread::sleep(std::time::Duration::from_millis(1000));
+                eprintln!("Error: {:?}, restarting pipeline", err);
+                restart_pipeline(uri.clone(), pipe);
+            }
+            gst::MessageView::Buffering(buffering) => {
+                let percent = buffering.get_percent();
+                print!("Buffering ({}%)\r", percent);
+                match std::io::stdout().flush() {
+                    Ok(_) => {}
+                    Err(err) => eprintln!("Failed: {}", err),
+                };
+
+                if percent < 100 {
+                    let _ = pipe.set_state(gst::State::Paused);
+                } else {
+                    let _ = pipe.set_state(gst::State::Playing);
+                }
+            }
+            gst::MessageView::Eos(_) => {
+                eprintln!("We are EOS");
+                restart_pipeline(uri.clone(), pipe);
+            }
+            _ => default_handle_message(pipe, msg),
+        };
+        glib::Continue(true)
+    })?;
+
+    Ok(pipe)
 }
 
 fn build_compositor_pipeline(args: &Args) -> Result<gst::Pipeline, anyhow::Error> {
@@ -64,7 +121,7 @@ fn build_compositor_pipeline(args: &Args) -> Result<gst::Pipeline, anyhow::Error
     interpipesrc.set_property("listen-to", &"rtmp")?;
     interpipesrc.set_property("format", &gst::Format::Time)?;
     interpipesrc.set_property("is-live", &true)?;
-    interpipesrc.set_property_from_str("stream-sync", &"compensate-ts");
+    interpipesrc.set_property_from_str("stream-sync", &"restart-ts");
 
     // FIXME: interpipesink should translate QoS events when stream-sync = compensate-ts
     sink.set_property("qos", &false).unwrap();
@@ -87,7 +144,21 @@ fn build_compositor_pipeline(args: &Args) -> Result<gst::Pipeline, anyhow::Error
     pad.set_property("width", &1280)?;
     pad.set_property("height", &720)?;
 
+    let bus = pipe.get_bus().unwrap();
+    let pipe_clone = pipe.clone();
+    bus.add_watch(move |_, msg| {
+        let pipe = &pipe_clone;
+        default_handle_message(pipe, msg);
+        glib::Continue(true)
+    })?;
+
     Ok(pipe)
+}
+
+fn restart_pipeline(uri: String, pipe: &gst::Pipeline) {
+    pipe.set_state(gst::State::Null).unwrap();
+    pipe.set_property("uri", &uri).unwrap();
+    pipe.set_state(gst::State::Playing).unwrap();
 }
 
 fn main() -> Result<(), anyhow::Error> {
@@ -96,54 +167,10 @@ fn main() -> Result<(), anyhow::Error> {
     let args = Args::from_args();
 
     let rtmp_pipe = build_rtmp_pipeline(&args)?;
-
     let compositor_pipe = build_compositor_pipeline(&args)?;
 
-    for pipe in &[rtmp_pipe.clone(), compositor_pipe.clone()] {
-        let bus = pipe.get_bus().unwrap();
-        let pipe_clone = pipe.clone();
-        bus.add_watch(move |_, msg| {
-            let pipe = &pipe_clone;
-            match msg.view() {
-                gst::MessageView::Latency(..) => {
-                    println!("Recalculating latency!");
-                    pipe.recalculate_latency().unwrap();
-                }
-                gst::MessageView::Error(err) => {
-                    eprintln!("Error: {:?}, restarting pipeline", err);
-                    pipe.set_state(gst::State::Null).unwrap();
-                    pipe.set_state(gst::State::Playing).unwrap();
-                }
-                gst::MessageView::Buffering(buffering) => {
-                    let percent = buffering.get_percent();
-                    print!("Buffering ({}%)\r", percent);
-                    match std::io::stdout().flush() {
-                        Ok(_) => {}
-                        Err(err) => eprintln!("Failed: {}", err),
-                    };
-
-                    if percent < 100 {
-                        let _ = pipe.set_state(gst::State::Paused);
-                    } else {
-                        let _ = pipe.set_state(gst::State::Playing);
-                    }
-                }
-                gst::MessageView::StateChanged(state_changed) => {
-                    if state_changed.get_src().map(|s| &s == pipe).unwrap_or(false)
-                        && state_changed.get_current() == gst::State::Playing
-                    {
-                        pipe.debug_to_dot_file(
-                            gst::DebugGraphDetails::all(),
-                            format!("PLAYING-{}", pipe.get_name()),
-                        );
-                    }
-                }
-                _ => (),
-            }
-            glib::Continue(true)
-        })?;
-        pipe.set_state(gst::State::Playing)?;
-    }
+    rtmp_pipe.set_state(gst::State::Playing)?;
+    compositor_pipe.set_state(gst::State::Playing)?;
 
     let main_loop = glib::MainLoop::new(None, false);
 

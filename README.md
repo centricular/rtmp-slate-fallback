@@ -54,5 +54,7 @@ Test with:
 cargo run -- --live-rtmp-uri rtmp://192.168.1.107:1935/live/myStreamd --eos-after 300 --discard-after 2
 ```
 
-When the input stream terminates normally, the last buffer should not be displayed
-longer than its normal duration. This can be verified with the above pipeline.
+The behaviour with this implementation is for EOS to be handled the same
+way as error. If this is not desirable, the EOS message handler should
+be modified to not restart the pipeline, and `forward-eos` should be
+set to TRUE on `interpipesink`.
